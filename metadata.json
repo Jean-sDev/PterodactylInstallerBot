@@ -1,0 +1,5 @@
+{
+  "name": "Pterodactyl Installer Bot",
+  "description": "Un bot Telegram pour installer Pterodactyl Panel, Wings, et configurer un serveur complet.",
+  "requestFramePermissions": []
+}
