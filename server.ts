@@ -88,8 +88,32 @@ function setupBotLogic(bot: TelegramBot) {
 
       case 'WAITING_SSH_PORT':
         state.sshPort = parseInt(text.trim(), 10) || 22;
-        state.step = 'WAITING_PASSWORD';
-        bot.sendMessage(chatId, 'Parfait. Veuillez entrer le mot de passe de votre serveur :\n*(Note: Ce mot de passe ne sera pas sauvegardé)*', { parse_mode: 'Markdown' });
+        state.step = 'WAITING_AUTH_METHOD';
+        bot.sendMessage(chatId, "Comment souhaitez-vous vous authentifier ?\nTapez 'mdp' pour un mot de passe, ou 'cle' pour une clé SSH privée :");
+        break;
+
+      case 'WAITING_AUTH_METHOD':
+        const method = text.trim().toLowerCase();
+        if (method === 'mdp' || method === 'mot de passe' || method === 'password') {
+          state.step = 'WAITING_PASSWORD';
+          bot.sendMessage(chatId, 'Veuillez entrer le mot de passe de votre serveur :\n*(Note: Ce mot de passe ne sera pas sauvegardé)*', { parse_mode: 'Markdown' });
+        } else if (method === 'cle' || method === 'clé' || method === 'key') {
+          state.step = 'WAITING_SSH_KEY';
+          bot.sendMessage(chatId, 'Veuillez coller votre clé privée SSH (commençant par -----BEGIN...) :\n*(Note: Cette clé ne sera pas sauvegardée. Pensez à supprimer votre message après l\'installation par sécurité)*', { parse_mode: 'Markdown' });
+        } else {
+          bot.sendMessage(chatId, "Choix invalide. Tapez 'mdp' ou 'cle' :");
+        }
+        break;
+
+      case 'WAITING_SSH_KEY':
+        const key = text.trim();
+        if (!key.includes('BEGIN')) {
+          bot.sendMessage(chatId, "Cela ne ressemble pas à une clé privée valide. Veuillez réessayer :");
+          return;
+        }
+        state.sshKey = key;
+        state.step = 'WAITING_PANEL_DOMAIN';
+        bot.sendMessage(chatId, "Avez-vous un nom de domaine pour le panel ?\nEnvoyez le domaine (ex: panel.domaine.com) ou tapez 'non' pour utiliser l'IP :");
         break;
 
       case 'WAITING_PASSWORD':
@@ -137,11 +161,11 @@ async function startInstallation(chatId: number, state: any, bot: TelegramBot) {
   conn.on('ready', () => {
     bot.sendMessage(chatId, '✅ Connexion SSH établie. Préparation du serveur...');
     
-    // Actual bash commands to install Docker, Pterodactyl Panel, Wings, Nginx and SSL
+    // Actual bash commands to install Docker, Pterodactyl Panel, Wings, Nginx/Apache and SSL
     const commands = [
       { 
         msg: 'Mise à jour des paquets et installation des dépendances...',
-        cmd: `export DEBIAN_FRONTEND=noninteractive; apt-get update -y && apt-get install -y curl wget git unzip tar nginx python3-certbot-nginx mariadb-client jq`
+        cmd: `export DEBIAN_FRONTEND=noninteractive; apt-get update -y && apt-get install -y curl wget git unzip tar mariadb-client jq certbot`
       },
       {
         msg: 'Installation de Docker et Docker Compose...',
@@ -194,13 +218,45 @@ cd /opt/pterodactyl && docker compose up -d database cache`
       },
       {
         msg: 'Configuration de la base de données et du Panel...',
-        cmd: `cd /opt/pterodactyl && sleep 15 && docker compose run --rm panel php artisan key:generate --force && docker compose run --rm panel php artisan p:environment:setup -n --author="admin@${state.panelDomain}" --url="${state.panelDomain === state.ip ? 'http://' + state.ip : 'https://' + state.panelDomain}" --timezone="Europe/Paris" --telemetry=false && docker compose run --rm panel php artisan p:environment:database -n --host="database" --port="3306" --database="panel" --username="pterodactyl" --password="${state.dbPassword}" && docker compose run --rm panel php artisan migrate --seed --force && docker compose run --rm panel php artisan p:user:make --email="admin@${state.panelDomain}" --username="admin" --name-first="Admin" --name-last="User" --password="admin" --admin=1 && docker compose up -d panel`
+        cmd: `cd /opt/pterodactyl && sleep 20 && docker compose run --rm panel php artisan key:generate --force && docker compose run --rm panel php artisan p:environment:setup -n --author="admin@${state.panelDomain}" --url="${state.panelDomain === state.ip ? 'http://' + state.ip : 'https://' + state.panelDomain}" --timezone="Europe/Paris" --telemetry=false && docker compose run --rm panel php artisan p:environment:database -n --host="database" --port="3306" --database="panel" --username="pterodactyl" --password="${state.dbPassword}" && docker compose run --rm panel php artisan migrate --seed --force && docker compose run --rm panel php artisan p:user:make --email="admin@${state.panelDomain}" --username="admin" --name-first="Admin" --name-last="User" --password="admin" --admin=1 && docker compose up -d panel`
       },
       {
-        msg: `Configuration de Nginx et SSL pour ${state.panelDomain}...`,
-        cmd: `rm -f /etc/nginx/sites-enabled/default
-if [ "${state.panelDomain}" != "${state.ip}" ]; then
-  cat << 'EOF' > /etc/nginx/sites-available/pterodactyl.conf
+        msg: `Configuration du serveur web (Nginx/Apache) et SSL pour ${state.panelDomain}...`,
+        cmd: `if dpkg -l | grep -qw apache2; then
+  echo "Apache détecté, configuration..."
+  export DEBIAN_FRONTEND=noninteractive; apt-get install -y libapache2-mod-proxy-html python3-certbot-apache
+  a2enmod proxy proxy_http proxy_wstunnel rewrite
+  if [ "${state.panelDomain}" != "${state.ip}" ]; then
+    cat << 'EOF' > /etc/apache2/sites-available/pterodactyl.conf
+<VirtualHost *:80>
+    ServerName ${state.panelDomain}
+    ProxyPreserveHost On
+    ProxyPass / http://127.0.0.1:8000/
+    ProxyPassReverse / http://127.0.0.1:8000/
+</VirtualHost>
+EOF
+    a2ensite pterodactyl.conf
+    if [ "${state.panelDomain}" != "${state.nodeDomain}" ] && [ "${state.nodeDomain}" != "${state.ip}" ]; then
+      cat << 'EOF' > /etc/apache2/sites-available/wings.conf
+<VirtualHost *:80>
+    ServerName ${state.nodeDomain}
+    DocumentRoot /var/www/html
+</VirtualHost>
+EOF
+      a2ensite wings.conf
+    fi
+    systemctl restart apache2
+    certbot --apache -d ${state.panelDomain} --non-interactive --agree-tos -m admin@${state.panelDomain} --redirect || true
+    if [ "${state.panelDomain}" != "${state.nodeDomain}" ] && [ "${state.nodeDomain}" != "${state.ip}" ]; then
+      certbot --apache -d ${state.nodeDomain} --non-interactive --agree-tos -m admin@${state.nodeDomain} --redirect || true
+    fi
+  fi
+else
+  echo "Nginx utilisé (ou aucun serveur web détecté), configuration..."
+  export DEBIAN_FRONTEND=noninteractive; apt-get install -y nginx python3-certbot-nginx
+  rm -f /etc/nginx/sites-enabled/default
+  if [ "${state.panelDomain}" != "${state.ip}" ]; then
+    cat << 'EOF' > /etc/nginx/sites-available/pterodactyl.conf
 server {
     listen 80;
     server_name ${state.panelDomain};
@@ -213,23 +269,24 @@ server {
     }
 }
 EOF
-  ln -sf /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf
-  
-  if [ "${state.panelDomain}" != "${state.nodeDomain}" ]; then
-    cat << 'EOF' > /etc/nginx/sites-available/wings.conf
+    ln -sf /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf
+    
+    if [ "${state.panelDomain}" != "${state.nodeDomain}" ] && [ "${state.nodeDomain}" != "${state.ip}" ]; then
+      cat << 'EOF' > /etc/nginx/sites-available/wings.conf
 server {
     listen 80;
     server_name ${state.nodeDomain};
     root /var/www/html;
 }
 EOF
-    ln -sf /etc/nginx/sites-available/wings.conf /etc/nginx/sites-enabled/wings.conf
-  fi
-  
-  systemctl restart nginx
-  certbot --nginx -d ${state.panelDomain} --non-interactive --agree-tos -m admin@${state.panelDomain} --redirect || true
-  if [ "${state.panelDomain}" != "${state.nodeDomain}" ]; then
-    certbot --nginx -d ${state.nodeDomain} --non-interactive --agree-tos -m admin@${state.nodeDomain} --redirect || true
+      ln -sf /etc/nginx/sites-available/wings.conf /etc/nginx/sites-enabled/wings.conf
+    fi
+    
+    systemctl restart nginx
+    certbot --nginx -d ${state.panelDomain} --non-interactive --agree-tos -m admin@${state.panelDomain} --redirect || true
+    if [ "${state.panelDomain}" != "${state.nodeDomain}" ] && [ "${state.nodeDomain}" != "${state.ip}" ]; then
+      certbot --nginx -d ${state.nodeDomain} --non-interactive --agree-tos -m admin@${state.nodeDomain} --redirect || true
+    fi
   fi
 fi`
       },
@@ -289,7 +346,7 @@ cd /opt/pterodactyl && docker compose -f docker-compose-wings.yml up -d`
 Profitez de votre panel Pterodactyl ! 🚀`;
 
         bot.sendMessage(chatId, successMsg, { parse_mode: 'Markdown' });
-        userStates.set(chatId, { step: 'IDLE' });
+        userStates.delete(chatId);
         return;
       }
 
@@ -328,12 +385,21 @@ Profitez de votre panel Pterodactyl ! 🚀`;
       errorMsg = "Délai d'attente dépassé. L'adresse IP est peut-être incorrecte ou le serveur est hors ligne.";
     }
     bot.sendMessage(chatId, `❌ Impossible de se connecter au serveur via SSH.\nErreur: ${errorMsg}`);
-    userStates.set(chatId, { step: 'IDLE' });
-  }).connect({
+    userStates.delete(chatId);
+  });
+  
+  const sshConfig: any = {
     host: state.ip,
     port: state.sshPort || 22,
     username: state.sshUsername || 'root',
-    password: state.password,
     readyTimeout: 10000
-  });
+  };
+  
+  if (state.sshKey) {
+    sshConfig.privateKey = state.sshKey;
+  } else {
+    sshConfig.password = state.password;
+  }
+  
+  conn.connect(sshConfig);
 }
